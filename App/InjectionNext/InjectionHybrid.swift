@@ -122,32 +122,51 @@ class InjectionHybrid: InjectionBase {
         }
 
         if source.hasSuffix(".xib") {
-            print("Custom Fork: Terdeteksi perubahan UI pada XIB -> \(source)")
-            
+            log("XIB change detected: \(source)")
+
             let targetAppName = self.determineAppName(for: source)
-            print("Custom Fork: Mencari Simulator Bundle untuk -> \(targetAppName)")
-            
-            if let appPath = self.customFindSimulatorAppPath(appName: targetAppName), !appPath.isEmpty {
-                let xibURL = URL(fileURLWithPath: source)
-                let xibName = xibURL.lastPathComponent
-                let nibName = xibName.replacingOccurrences(of: ".xib", with: ".nib")
-                let targetNibPath = self.findExistingNibPath(in: appPath, nibName: nibName) ?? "\(appPath)/\(nibName)"
-                
-                print("Custom Fork: Mengompilasi \(xibName) ke Simulator...")
-                if self.customCompileXib(xibPath: source, targetNibPath: targetNibPath) {
-                    print("Custom Fork: NIB Berhasil disuntikkan!")
-                    
-                    for client in InjectionServer.currentClients {
-                        client?.sendCommand(.reloadXIB, with: nibName.replacingOccurrences(of: ".nib", with: ""))
-                    }
-                    
-                    let swiftPath = source.replacingOccurrences(of: ".xib", with: ".swift")
-                    if FileManager.default.fileExists(atPath: swiftPath) {
-                        try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: swiftPath)
-                    }
+            let xibURL = URL(fileURLWithPath: source)
+            let nibName = xibURL.deletingPathExtension().lastPathComponent + ".nib"
+
+            // Find ALL locations where this NIB exists:
+            //  - DerivedData build products  (where the running app loads frameworks)
+            //  - CoreSimulator app bundles   (installed copy)
+            var allNibPaths = self.findAllExistingNibPaths(nibName: nibName, appName: targetAppName)
+
+            // Fallback: if nothing found, try the simulator app bundle root
+            if allNibPaths.isEmpty,
+               let appPath = self.customFindSimulatorAppPath(appName: targetAppName),
+               !appPath.isEmpty {
+                allNibPaths = ["\(appPath)/\(nibName)"]
+            }
+
+            guard !allNibPaths.isEmpty else {
+                log("XIB reload: no target NIB paths found for \(nibName) (app: \(targetAppName))")
+                return
+            }
+
+            var compiled = false
+            for targetPath in allNibPaths {
+                log("XIB reload: compiling \(nibName) → \(targetPath)")
+                if self.customCompileXib(xibPath: source, targetNibPath: targetPath) {
+                    compiled = true
+                }
+            }
+
+            if compiled {
+                log("XIB reload: compiled to \(allNibPaths.count) location(s)")
+                for client in InjectionServer.currentClients {
+                    client?.sendCommand(.reloadXIB,
+                        with: nibName.replacingOccurrences(of: ".nib", with: ""))
+                }
+
+                let swiftPath = source.replacingOccurrences(of: ".xib", with: ".swift")
+                if FileManager.default.fileExists(atPath: swiftPath) {
+                    try? FileManager.default.setAttributes(
+                        [.modificationDate: Date()], ofItemAtPath: swiftPath)
                 }
             } else {
-                print("Custom Fork: Gagal menemukan bundle \(targetAppName) di Simulator. Apakah app sudah running?")
+                log("XIB reload: ibtool failed for all target paths")
             }
             return
         }
@@ -222,12 +241,12 @@ class HybridCompiler: NextCompiler {
 }
 
 extension InjectionHybrid {
-    
+
     func determineAppName(for source: String) -> String {
         if Reloader.appName != "Unknown" && !Reloader.appName.isEmpty {
             return Reloader.appName + ".app"
         }
-        
+
         var dir = URL(fileURLWithPath: source).deletingLastPathComponent()
         while dir.path != "/" {
             if let files = try? FileManager.default.contentsOfDirectory(atPath: dir.path) {
@@ -235,50 +254,59 @@ extension InjectionHybrid {
                     return xcodeProj.replacingOccurrences(of: ".xcodeproj", with: ".app")
                 }
                 if files.contains("project.yml") {
-                    let folderName = dir.lastPathComponent
-                    return "\(folderName).app"
+                    return "\(dir.lastPathComponent).app"
                 }
             }
             dir = dir.deletingLastPathComponent()
         }
-        
+
         guard let root = self.projectRootPath else { return "*.app" }
-        
+
         if let files = try? FileManager.default.contentsOfDirectory(atPath: root),
            let xcodeProj = files.first(where: { $0.hasSuffix(".xcodeproj") }) {
             return xcodeProj.replacingOccurrences(of: ".xcodeproj", with: ".app")
         }
-        
-        let folderName = URL(fileURLWithPath: root).lastPathComponent
-        return "\(folderName).app"
+        return "\(URL(fileURLWithPath: root).lastPathComponent).app"
     }
-    
+
+    // MARK: - XIB compilation helpers
+
+    /// Find ALL existing copies of a NIB file across DerivedData and CoreSimulator.
+    ///
+    /// In the iOS Simulator, frameworks are often loaded directly from the
+    /// DerivedData build-products directory via @rpath, so `Bundle(for:)`
+    /// returns a DerivedData path.  Meanwhile the installed .app copy lives
+    /// under CoreSimulator.  We must update **both** so the running process
+    /// picks up the change immediately.
+    func findAllExistingNibPaths(nibName: String, appName: String) -> [String] {
+        let baseName = appName.replacingOccurrences(of: ".app", with: "")
+        let homeDir = NSHomeDirectory()
+        // Search DerivedData (build products) and CoreSimulator (installed app)
+        let cmd = "find"
+            + " \"\(homeDir)/Library/Developer/Xcode/DerivedData/\""
+            + " \"\(homeDir)/Library/Developer/CoreSimulator/Devices/\""
+            + " -name \"\(nibName)\" 2>/dev/null"
+            + " | grep -i \"\(baseName)\""
+        return runShell(cmd)
+            .components(separatedBy: "\n")
+            .filter { !$0.isEmpty }
+    }
+
     func customFindSimulatorAppPath(appName: String) -> String? {
-        let cmd = "find ~/Library/Developer/CoreSimulator/Devices/ -name \"\(appName)\" -print0 2>/dev/null | xargs -0 stat -f \"%m %N\" 2>/dev/null | sort -rn | head -n 1 | cut -d' ' -f2-"
-        
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        process.arguments = ["-c", cmd]
-        
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = Pipe()
-        
-        do {
-            try process.run()
-            process.waitUntilExit()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        } catch {
-            return nil
-        }
+        let cmd = """
+            find ~/Library/Developer/CoreSimulator/Devices/ \
+                -name "\(appName)" -print0 2>/dev/null \
+            | xargs -0 stat -f "%m %N" 2>/dev/null \
+            | sort -rn | head -n 1 | cut -d' ' -f2-
+            """
+        let result = runShell(cmd)
+        return result.isEmpty ? nil : result
     }
-    
+
     func customCompileXib(xibPath: String, targetNibPath: String) -> Bool {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/ibtool")
         process.arguments = ["--compile", targetNibPath, xibPath]
-        
         do {
             try process.run()
             process.waitUntilExit()
@@ -287,18 +315,35 @@ extension InjectionHybrid {
             return false
         }
     }
-    
+
     func findExistingNibPath(in appPath: String, nibName: String) -> String? {
-        let fileManager = FileManager.default
         let appURL = URL(fileURLWithPath: appPath)
-        
-        if let enumerator = fileManager.enumerator(at: appURL, includingPropertiesForKeys: nil) {
-            for case let fileURL as URL in enumerator {
-                if fileURL.lastPathComponent == nibName {
-                    return fileURL.path
-                }
+        if let enumerator = FileManager.default.enumerator(
+            at: appURL, includingPropertiesForKeys: nil) {
+            for case let fileURL as URL in enumerator
+                where fileURL.lastPathComponent == nibName {
+                return fileURL.path
             }
         }
         return nil
+    }
+
+    /// Run a shell command and return trimmed stdout.
+    private func runShell(_ cmd: String) -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = ["-c", cmd]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        do {
+            try process.run()
+            process.waitUntilExit()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            return (String(data: data, encoding: .utf8) ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        } catch {
+            return ""
+        }
     }
 }
