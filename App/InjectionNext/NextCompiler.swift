@@ -523,6 +523,10 @@ class NextCompiler {
     // MARK: - XIB Helpers
 
     func determineAppName(for source: String) -> String {
+        if Reloader.appName != "Unknown" && !Reloader.appName.isEmpty {
+            return Reloader.appName + ".app"
+        }
+        
         var dir = URL(fileURLWithPath: source).deletingLastPathComponent()
         while dir.path != "/" {
             if let files = try? FileManager.default.contentsOfDirectory(atPath: dir.path) {
