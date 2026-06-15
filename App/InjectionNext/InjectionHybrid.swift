@@ -68,16 +68,18 @@ class InjectionHybrid: InjectionBase {
     /// Minimum seconds between injections
     let minInterval = 1.0
 
+    var projectRootPath: String?
+
     init(watching path: String) { // FileWatcher compatibility
+        self.projectRootPath = path
         let watchPaths = (getenv(INJECTION_DIRECTORIES) == nil ?
             NSHomeDirectory()+"/Library/Developer," : "") + path
         setenv(INJECTION_DIRECTORIES, watchPaths, 1)
         Reloader.injectionQueue = .main
         super.init()
         do {
-            // Extend FileWatcher pattern to detect git lock files
-            FileWatcher.INJECTABLE_PATTERN = try NSRegularExpression(
-                pattern: ConfigStore.shared.injectablePattern)
+            let customPattern = "(\(ConfigStore.shared.injectablePattern))|\\.xib$"
+            FileWatcher.INJECTABLE_PATTERN = try NSRegularExpression(pattern: customPattern)
         } catch {
             InjectionServer.error("Invalid file pattern: \(error)")
         }
@@ -117,6 +119,33 @@ class InjectionHybrid: InjectionBase {
                 // Lock file is gone - was probably just a commit
                 Self.gitLockPath = nil
             }
+        }
+
+        if source.hasSuffix(".xib") {
+            print("Custom Fork: Terdeteksi perubahan UI pada XIB -> \(source)")
+            
+            let targetAppName = self.determineAppName()
+            print("Custom Fork: Mencari Simulator Bundle untuk -> \(targetAppName)")
+            
+            if let appPath = self.customFindSimulatorAppPath(appName: targetAppName), !appPath.isEmpty {
+                let xibURL = URL(fileURLWithPath: source)
+                let xibName = xibURL.lastPathComponent
+                let nibName = xibName.replacingOccurrences(of: ".xib", with: ".nib")
+                let targetNibPath = "\(appPath)/\(nibName)"
+                
+                print("Custom Fork: Mengompilasi \(xibName) ke Simulator...")
+                if self.customCompileXib(xibPath: source, targetNibPath: targetNibPath) {
+                    print("Custom Fork: NIB Berhasil disuntikkan!")
+                    
+                    let swiftPath = source.replacingOccurrences(of: ".xib", with: ".swift")
+                    if FileManager.default.fileExists(atPath: swiftPath) {
+                        try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: swiftPath)
+                    }
+                }
+            } else {
+                print("Custom Fork: Gagal menemukan bundle \(targetAppName) di Simulator. Apakah app sudah running?")
+            }
+            return
         }
 
         let now = Date.timeIntervalSinceReferenceDate
@@ -185,5 +214,55 @@ class HybridCompiler: NextCompiler {
     override func link(object: String, dylib: String, arch: String) -> (String, Double)? {
         return super.link(object: object, dylib: dylib, arch: arch) ??
                                    Self.liteRecompiler.linkingFailed()
+    }
+}
+
+extension InjectionHybrid {
+    
+    func determineAppName() -> String {
+        guard let root = self.projectRootPath else { return "*.app" }
+        
+        if let files = try? FileManager.default.contentsOfDirectory(atPath: root),
+           let xcodeProj = files.first(where: { $0.hasSuffix(".xcodeproj") }) {
+            return xcodeProj.replacingOccurrences(of: ".xcodeproj", with: ".app")
+        }
+        
+        let folderName = URL(fileURLWithPath: root).lastPathComponent
+        return "\(folderName).app"
+    }
+    
+    func customFindSimulatorAppPath(appName: String) -> String? {
+        let cmd = "find ~/Library/Developer/CoreSimulator/Devices/ -name \"\(appName)\" -print0 2>/dev/null | xargs -0 stat -f \"%m %N\" 2>/dev/null | sort -rn | head -n 1 | cut -d' ' -f2-"
+        
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = ["-c", cmd]
+        
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        
+        do {
+            try process.run()
+            process.waitUntilExit()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        } catch {
+            return nil
+        }
+    }
+    
+    func customCompileXib(xibPath: String, targetNibPath: String) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/ibtool")
+        process.arguments = ["--compile", targetNibPath, xibPath]
+        
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus == 0
+        } catch {
+            return false
+        }
     }
 }
