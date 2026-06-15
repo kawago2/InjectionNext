@@ -124,18 +124,22 @@ class InjectionHybrid: InjectionBase {
         if source.hasSuffix(".xib") {
             print("Custom Fork: Terdeteksi perubahan UI pada XIB -> \(source)")
             
-            let targetAppName = self.determineAppName()
+            let targetAppName = self.determineAppName(for: source)
             print("Custom Fork: Mencari Simulator Bundle untuk -> \(targetAppName)")
             
             if let appPath = self.customFindSimulatorAppPath(appName: targetAppName), !appPath.isEmpty {
                 let xibURL = URL(fileURLWithPath: source)
                 let xibName = xibURL.lastPathComponent
                 let nibName = xibName.replacingOccurrences(of: ".xib", with: ".nib")
-                let targetNibPath = "\(appPath)/\(nibName)"
+                let targetNibPath = self.findExistingNibPath(in: appPath, nibName: nibName) ?? "\(appPath)/\(nibName)"
                 
                 print("Custom Fork: Mengompilasi \(xibName) ke Simulator...")
                 if self.customCompileXib(xibPath: source, targetNibPath: targetNibPath) {
                     print("Custom Fork: NIB Berhasil disuntikkan!")
+                    
+                    for client in InjectionServer.currentClients {
+                        client?.sendCommand(.reloadXIB, with: nibName.replacingOccurrences(of: ".nib", with: ""))
+                    }
                     
                     let swiftPath = source.replacingOccurrences(of: ".xib", with: ".swift")
                     if FileManager.default.fileExists(atPath: swiftPath) {
@@ -219,7 +223,25 @@ class HybridCompiler: NextCompiler {
 
 extension InjectionHybrid {
     
-    func determineAppName() -> String {
+    func determineAppName(for source: String) -> String {
+        if Reloader.appName != "Unknown" && !Reloader.appName.isEmpty {
+            return Reloader.appName + ".app"
+        }
+        
+        var dir = URL(fileURLWithPath: source).deletingLastPathComponent()
+        while dir.path != "/" {
+            if let files = try? FileManager.default.contentsOfDirectory(atPath: dir.path) {
+                if let xcodeProj = files.first(where: { $0.hasSuffix(".xcodeproj") }) {
+                    return xcodeProj.replacingOccurrences(of: ".xcodeproj", with: ".app")
+                }
+                if files.contains("project.yml") {
+                    let folderName = dir.lastPathComponent
+                    return "\(folderName).app"
+                }
+            }
+            dir = dir.deletingLastPathComponent()
+        }
+        
         guard let root = self.projectRootPath else { return "*.app" }
         
         if let files = try? FileManager.default.contentsOfDirectory(atPath: root),
@@ -264,5 +286,19 @@ extension InjectionHybrid {
         } catch {
             return false
         }
+    }
+    
+    func findExistingNibPath(in appPath: String, nibName: String) -> String? {
+        let fileManager = FileManager.default
+        let appURL = URL(fileURLWithPath: appPath)
+        
+        if let enumerator = fileManager.enumerator(at: appURL, includingPropertiesForKeys: nil) {
+            for case let fileURL as URL in enumerator {
+                if fileURL.lastPathComponent == nibName {
+                    return fileURL.path
+                }
+            }
+        }
+        return nil
     }
 }

@@ -139,6 +139,10 @@ class NextCompiler {
                 if self.customCompileXib(xibPath: source, targetNibPath: targetNibPath) {
                     log("Custom Fork: NIB Berhasil disuntikkan!")
                     
+                    for client in InjectionServer.currentClients {
+                        client?.sendCommand(.reloadXIB, with: nibName.replacingOccurrences(of: ".nib", with: ""))
+                    }
+                    
                     let swiftPath = source.replacingOccurrences(of: ".xib", with: ".swift")
                     let exists = FileManager.default.fileExists(atPath: swiftPath)
                     let hasArgs = self.compilations[swiftPath] != nil

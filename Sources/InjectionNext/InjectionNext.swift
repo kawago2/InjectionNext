@@ -394,6 +394,11 @@ open class InjectionNext: SimpleSocket {
                         break
                     }
                 }
+            case .reloadXIB:
+                guard let nibName = readString() else {
+                    return error("Unable to read NIB name")
+                }
+                loader.sweeper.sweepAndReloadXIB(nibName: nibName)
             case .EOF:
                 return
             default:

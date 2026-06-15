@@ -46,6 +46,7 @@ typedef NS_ENUM(int, InjectionCommand) {
     InjectionScreenshot,
     InjectionReplayEvents,
     InjectionCaptureEvents,
+    InjectionReloadXIB,
 
     InjectionInvalid = 1000,
 
